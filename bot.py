@@ -23,8 +23,8 @@ async def start(update: Update, context):
 def home():
     return "Bot MoneyToFlows is running ✅"
 
-# --- Webhook ---
-@app.route(f'/{TOKEN}', methods=['POST'])
+# --- Webhook (point d'entrée Telegram) ---
+@app.route('/webhook', methods=['POST'])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     asyncio.run(app_telegram.process_update(update))
