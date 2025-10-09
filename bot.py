@@ -3,64 +3,64 @@ from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 import asyncio
 import os
-import logging
+import requests
 
 # --- Configuration ---
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = "https://moneytoflowsbot-6.onrender.com"  # <-- ton URL Render
+TOKEN = os.getenv("BOT_TOKEN")  # Ton token Telegram stocké sur Render
+WEBHOOK_URL = "https://moneytoflowsbot-7.onrender.com"  # <-- Remplace ici à chaque nouveau déploiement
 
-# --- Initialisation ---
 app = Flask(__name__)
 bot = Bot(token=TOKEN)
 
-# Activer les logs pour Render (important pour voir les erreurs)
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-
 # --- Commande /start ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        user = update.effective_user
-        await update.message.reply_text(
-            f"Bienvenue {user.first_name} 👋\n"
-            "Ceci est le bot de parrainage *MoneyToFlows* 💸\n\n"
-            "Tape /dashboard pour voir ton tableau de bord."
-        )
-    except Exception as e:
-        logging.error(f"Erreur dans /start : {e}")
+    user = update.effective_user
+    await update.message.reply_text(
+        f"👋 Bienvenue {user.first_name} !\n\n"
+        "🔥 Ceci est le bot officiel *MoneyToFlows*.\n"
+        "💸 Gagne des revenus grâce au parrainage automatisé !\n\n"
+        "📊 Tape /dashboard pour voir ton tableau de bord."
+    )
 
 # --- Commande /dashboard ---
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text("Voici ton tableau de bord 📊 (bientôt disponible).")
-    except Exception as e:
-        logging.error(f"Erreur dans /dashboard : {e}")
+    await update.message.reply_text(
+        "📊 *Ton tableau de bord MoneyToFlows* :\n"
+        "- Parrains : 0\n"
+        "- Gains : 0 FCFA\n"
+        "- Statut : En cours 🚀",
+        parse_mode="Markdown"
+    )
 
-# --- Application Telegram ---
-application = Application.builder().token(TOKEN).build()
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("dashboard", dashboard))
+# --- Réception des mises à jour Telegram ---
+@app.route(f"/{TOKEN}", methods=["POST"])
+def receive_update():
+    data = request.get_json(force=True)
+    update = Update.de_json(data, bot)
+    asyncio.run(app_telegram.process_update(update))
+    return "OK", 200
 
-# --- Route d’accueil ---
+# --- Route de test ---
 @app.route('/')
 def home():
-    return "Bot MoneyToFlows is running ✅"
+    return "✅ Bot MoneyToFlows en ligne et opérationnel !"
 
-# --- Réception des messages Telegram (webhook endpoint) ---
-@app.route(f'/{TOKEN}', methods=['POST'])
-def receive_update():
-    try:
-        data = request.get_json(force=True)
-        update = Update.de_json(data, bot)
-        asyncio.run(application.process_update(update))
-    except Exception as e:
-        logging.error(f"Erreur lors du traitement de la mise à jour : {e}")
-        return "error", 500
-    return "ok", 200
+# --- Lancement du bot Telegram ---
+app_telegram = Application.builder().token(TOKEN).build()
+app_telegram.add_handler(CommandHandler("start", start))
+app_telegram.add_handler(CommandHandler("dashboard", dashboard))
 
-# --- Lancement Flask ---
+# --- Configuration automatique du Webhook ---
+def set_webhook():
+    webhook_url = f"{WEBHOOK_URL}/{TOKEN}"
+    resp = requests.get(
+        f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={webhook_url}"
+    )
+    print("Webhook setup response:", resp.text)
+
+set_webhook()
+
+# --- Démarrage du serveur Flask ---
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
