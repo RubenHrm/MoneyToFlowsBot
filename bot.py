@@ -7,7 +7,7 @@ import logging
 
 # --- Configuration ---
 TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = "https://moneytoflowsbot-5.onrender.com"  # <-- Ton URL Render actuelle
+WEBHOOK_URL = "https://moneytoflowsbot-6.onrender.com"  # <-- ton URL Render
 
 # --- Initialisation ---
 app = Flask(__name__)
@@ -48,7 +48,7 @@ application.add_handler(CommandHandler("dashboard", dashboard))
 def home():
     return "Bot MoneyToFlows is running ✅"
 
-# --- Réception des messages Telegram ---
+# --- Réception des messages Telegram (webhook endpoint) ---
 @app.route(f'/{TOKEN}', methods=['POST'])
 def receive_update():
     try:
