@@ -1,18 +1,18 @@
-# bot.py — MoneyToFlows (FINAL complet)
+# bot.py — MoneyToFlows (v12 stable, complet)
 import os
 import sqlite3
 import asyncio
 import logging
 from datetime import datetime
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = "https://moneytoflowsbot-11.onrender.com"  # adapte si besoin
-ADMIN_USERNAME = "RUBENHRM777"  # ton @ sans @
-PRODUCT_PRICE = 5000  # FCFA (modifiable)
+WEBHOOK_URL = "https://moneytoflowsbot-12.onrender.com"
+ADMIN_USERNAME = "RUBENHRM777"
+PRODUCT_PRICE = 5000
 DB_FILE = "data.db"
 
 if not TOKEN:
@@ -70,7 +70,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-    logging.info("DB initialized.")
+    logging.info("✅ Base de données initialisée.")
 
 def db(query, params=(), fetch=False):
     conn = sqlite3.connect(DB_FILE)
@@ -81,7 +81,7 @@ def db(query, params=(), fetch=False):
     conn.close()
     return rows
 
-# init DB at import (safe)
+# initialize DB on import
 init_db()
 
 # --------------- HELPERS ----------------
@@ -128,7 +128,6 @@ def credit_parrain_for_buyer(buyer_id):
     if not row or not row[0][0]:
         return None
     parrain_id = row[0][0]
-    # compute after validation (caller must have marked validated)
     acheteurs = count_validated_acheteurs(parrain_id)
     pct = compute_pct(acheteurs)
     amount = PRODUCT_PRICE * pct
@@ -155,7 +154,7 @@ def set_mm_number(user_id, mm):
 def create_withdrawal(user_id, amount, mm):
     db("INSERT INTO withdrawals (user_id, amount, mm_number, status, created_at) VALUES (?, ?, ?, ?, ?)",
        (user_id, amount, mm, "pending", datetime.utcnow().isoformat()))
-    # mark earnings as paid to avoid duplicate requests
+    # mark earnings paid to avoid duplicate requests
     db("UPDATE earnings SET paid = 1 WHERE user_id = ?", (user_id,))
 
 # -------------- HANDLERS --------------
@@ -163,7 +162,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user_record(user)
 
-    # parse deep-link: accepts ref_123 or plain digits
+    # parse deep-link: accepts "ref_123" or plain digits
     parrain_id = None
     if context.args:
         arg = context.args[0]
@@ -178,14 +177,12 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     row = get_user_row(user.id)
     if parrain_id and parrain_id != user.id and row and row[3] is None:
-        # set parrain only if not already set
         set_parrain(user.id, parrain_id)
         try:
             await context.bot.send_message(parrain_id, f"🎉 Nouveau filleul inscrit : @{user.username or user.first_name}")
         except Exception:
-            logging.exception("Impossible de notifier le parrain")
+            logging.exception("Erreur notification parrain")
 
-    # referral link
     try:
         bot_username = (await context.bot.get_me()).username
     except Exception:
@@ -200,7 +197,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def achat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🛒 Lien d'achat officiel:\nhttps://sgzxfbtn.mychariow.shop/prd_8ind83\n\nAprès achat, envoie la référence avec /confirm_purchase <REFERENCE>.")
+    await update.message.reply_text(
+        "🛒 Lien d'achat officiel:\nhttps://sgzxfbtn.mychariow.shop/prd_8ind83\n\n"
+        "Après achat, envoie la référence avec /confirm_purchase <REFERENCE>."
+    )
 
 async def confirm_purchase_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -211,14 +211,13 @@ async def confirm_purchase_handler(update: Update, context: ContextTypes.DEFAULT
     ensure_user_record(user)
     pid = add_purchase(user.id, reference)
     await update.message.reply_text(f"✅ Référence reçue (ID {pid}). L'admin la validera sous peu.")
-    # notify admins
     admins = db("SELECT user_id FROM users WHERE is_admin = 1", fetch=True)
     if admins:
         for a in admins:
             try:
-                await context.bot.send_message(a[0], f"Nouvelle référence à valider : user {user.id} / @{user.username} / ref: {reference} (purchase_id: {pid})")
+                await context.bot.send_message(a[0], f"Nouvelle référence à valider : user {user.id} / @{user.username} / ref: {reference} (ID:{pid})")
             except Exception:
-                logging.exception("Impossible de notifier admin")
+                logging.exception("notify admin failed")
 
 async def parrainage_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -271,7 +270,7 @@ async def retrait_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Tu n'as pas de solde disponible pour retrait.")
         return
     create_withdrawal(user.id, amount, mm)
-    await update.message.reply_text(f"✅ Demande de retrait enregistrée pour {amount} FCFA. L'admin te contactera pour le paiement.")
+    await update.message.reply_text(f"✅ Demande de retrait enregistrée pour {amount} FCFA. L'admin te contactera pour confirmation.")
 
 # ------------- ADMIN HANDLERS -------------
 async def admin_register_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -354,7 +353,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user_record(user)
     row = get_user_row(user.id)
-    # save MM if looks like a phone number and not set yet
     if row and (row[5] is None) and text.replace("+","").replace(" ","").isdigit() and 6 <= len(text) <= 15:
         set_mm_number(user.id, text)
         await update.message.reply_text(f"✅ Numéro Mobile Money enregistré : {text}")
@@ -379,6 +377,23 @@ application.add_handler(CommandHandler("pay_withdrawal", pay_withdrawal_handler)
 
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
+# === START TELEGRAM APP IN BACKGROUND (safe for Gunicorn) ===
+def _start_telegram_app_in_background():
+    import threading
+    def _runner():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        # initialize and start the application on this loop
+        loop.run_until_complete(application.initialize())
+        loop.run_until_complete(application.start())
+        loop.run_forever()
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+
+# start app background worker so update_queue is processed
+_start_telegram_app_in_background()
+
 # ------------- WEBHOOK -------------
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook_endpoint():
@@ -386,7 +401,8 @@ def webhook_endpoint():
         data = request.get_json(force=True)
         logging.info("Webhook received")
         update = Update.de_json(data, bot)
-        asyncio.run(application.process_update(update))
+        # put update into Application queue (non-blocking)
+        application.update_queue.put_nowait(update)
     except Exception:
         logging.exception("Error processing update")
         return "error", 500
@@ -394,15 +410,13 @@ def webhook_endpoint():
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "ok", "service": "MoneyToFlows", "version": "stable-11"})
+    return jsonify({"status": "ok", "service": "MoneyToFlows", "version": "stable-12"})
 
-# ------------- START (local) -------------
+# ------------- MAIN (local run) -------------
 if __name__ == "__main__":
-    # try to set webhook automatically when running directly
     try:
-        url = f"{WEBHOOK_URL}/{TOKEN}"
-        r = bot.set_webhook(url=url)
-        logging.info("set_webhook response: %s", r)
+        bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
+        logging.info("Webhook set successfully.")
     except Exception:
         logging.exception("Could not set webhook automatically.")
     port = int(os.environ.get("PORT", 5000))
