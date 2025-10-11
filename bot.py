@@ -1,4 +1,4 @@
-# bot.py — MoneyToFlows v14 (complet, prêt pour Render)
+# bot.py — MoneyToFlows v15 (complet pour Render)
 import os
 import sqlite3
 import threading
@@ -16,27 +16,37 @@ from telegram.ext import (
 )
 
 # ---------------- CONFIG ----------------
+# Token must be set in Render > Environment > BOT_TOKEN
 TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_HOSTNAME = "https://moneytoflowsbot-14.onrender.com"  # adapte si tu renommes le service
-ADMIN_USERNAME = "RUBENHRM777"  # ton @ sans @
-PRODUCT_PRICE = 5000  # FCFA (modifiable)
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN non défini. Mets-le dans Render > Environment variables.")
+
+# Public URL (change only if your Render service name is different)
+WEBHOOK_HOSTNAME = "https://moneytoflowsbot-15.onrender.com"
+
+# Admin username (without @) - change if needed
+ADMIN_USERNAME = "RUBENHRM777"
+
+# Product price and thresholds
+PRODUCT_PRICE = 5000  # FCFA
+MIN_FILLEULS_FOR_WITHDRAW = 5
+
+# DB file
 DB_FILE = "data.db"
 
-if not TOKEN:
-    raise RuntimeError("La variable d'environnement BOT_TOKEN n'est pas définie. Met-la dans Render > Environment variables.")
+# ---------------- LOGGING ----------------
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    level=logging.DEBUG,  # DEBUG to see trace messages
+)
+logger = logging.getLogger("moneytoflows-v15")
 
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logging.info("▶ Démarrage MoneyToFlows v14...")
-
-# Flask app
+# ---------------- FLASK & TELEGRAM APP ----------------
 app = Flask(__name__)
-
-# Telegram bot & application
 bot = Bot(token=TOKEN)
 application = Application.builder().token(TOKEN).build()
 
-# -------------- DATABASE ----------------
+# ---------------- DATABASE ----------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -82,7 +92,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-    logging.info("✅ Base de données initialisée.")
+    logger.info("✅ DB initialized.")
 
 def db(query, params=(), fetch=False):
     conn = sqlite3.connect(DB_FILE)
@@ -95,18 +105,15 @@ def db(query, params=(), fetch=False):
 
 init_db()
 
-# --------------- HELPERS ----------------
+# ---------------- HELPERS ----------------
 def ensure_user_record(user):
     if not db("SELECT 1 FROM users WHERE user_id = ?", (user.id,), fetch=True):
         db("INSERT INTO users (user_id, username, first_name, registered_at) VALUES (?, ?, ?, ?)",
            (user.id, user.username or "", user.first_name or "", datetime.utcnow().isoformat()))
 
 def get_user_row(user_id):
-    rows = db(
-        "SELECT user_id, username, first_name, parrain_id, registered_at, mm_number, is_admin FROM users WHERE user_id = ?",
-        (user_id,),
-        fetch=True,
-    )
+    rows = db("SELECT user_id, username, first_name, parrain_id, registered_at, mm_number, is_admin FROM users WHERE user_id = ?",
+              (user_id,), fetch=True)
     return rows[0] if rows else None
 
 def set_parrain(child_id, parrain_id):
@@ -122,6 +129,7 @@ def add_purchase(user_id, reference):
     return pid
 
 def compute_pct(n_acheteurs):
+    # returns fraction (0.2, 0.3, 0.4)
     if n_acheteurs >= 100:
         return 0.40
     if n_acheteurs >= 50:
@@ -170,12 +178,13 @@ def create_withdrawal(user_id, amount, mm):
        (user_id, amount, mm, "pending", datetime.utcnow().isoformat()))
     db("UPDATE earnings SET paid = 1 WHERE user_id = ?", (user_id,))
 
-# -------------- HANDLERS --------------
+# ---------------- HANDLERS (USER) ----------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    logger.info("Received /start from %s (%s)", user.username, user.id)
     ensure_user_record(user)
 
-    # deep link parser
+    # parse deep-link: "ref_<id>" or plain digits
     parrain_id = None
     if context.args:
         arg = context.args[0]
@@ -194,7 +203,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(parrain_id, f"🎉 Nouveau filleul inscrit : @{user.username or user.first_name}")
         except Exception:
-            logging.exception("Impossible de notifier le parrain")
+            logger.exception("notify parrain failed")
 
     try:
         bot_username = (await context.bot.get_me()).username
@@ -210,10 +219,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def achat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🛒 Lien d'achat officiel:\nhttps://sgzxfbtn.mychariow.shop/prd_8ind83\n\n"
-        "Après achat, envoie la référence avec /confirm_purchase <REFERENCE>."
-    )
+    await update.message.reply_text(f"🛒 Lien d'achat officiel:\nhttps://sgzxfbtn.mychariow.shop/prd_8ind83\n\nAprès achat, envoie la référence avec /confirm_purchase <REFERENCE>.")
 
 async def confirm_purchase_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -230,7 +236,7 @@ async def confirm_purchase_handler(update: Update, context: ContextTypes.DEFAULT
             try:
                 await context.bot.send_message(a[0], f"Nouvelle référence à valider : user {user.id} / @{user.username} / ref: {reference} (ID:{pid})")
             except Exception:
-                logging.exception("notify admin failed")
+                logger.exception("notify admin failed")
 
 async def parrainage_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -253,7 +259,7 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 Gains totaux : {int(stats['total'])} FCFA\n"
         f"💵 Solde disponible : {int(stats['pending'])} FCFA\n"
         f"🔖 Taux actuel : {stats['pct']}%\n\n"
-        f"🔔 Seuil retrait : 5 filleuls acheteurs"
+        f"🔔 Seuil retrait : {MIN_FILLEULS_FOR_WITHDRAW} filleuls acheteurs"
     )
 
 async def setmm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,8 +276,8 @@ async def retrait_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user_record(user)
     stats = get_parrain_stats(user.id)
-    if stats['acheteurs'] < 5:
-        await update.message.reply_text(f"🚫 Il te faut au moins 5 filleuls acheteurs pour demander un retrait. Actuels : {stats['acheteurs']}/5")
+    if stats['acheteurs'] < MIN_FILLEULS_FOR_WITHDRAW:
+        await update.message.reply_text(f"🚫 Il te faut au moins {MIN_FILLEULS_FOR_WITHDRAW} filleuls acheteurs. Actuels : {stats['acheteurs']}/{MIN_FILLEULS_FOR_WITHDRAW}")
         return
     row = get_user_row(user.id)
     mm = row[5] if row else None
@@ -283,9 +289,9 @@ async def retrait_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Tu n'as pas de solde disponible pour retrait.")
         return
     create_withdrawal(user.id, amount, mm)
-    await update.message.reply_text(f"✅ Demande de retrait enregistrée pour {amount} FCFA. L'admin te contactera pour confirmation.")
+    await update.message.reply_text(f"✅ Demande de retrait enregistrée pour {amount} FCFA. L'admin te contactera pour la confirmation.")
 
-# ------------- ADMIN HANDLERS -------------
+# ---------------- HANDLERS (ADMIN) ----------------
 async def admin_register_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if (user.username or "").lower() != ADMIN_USERNAME.lower():
@@ -360,20 +366,19 @@ async def pay_withdrawal_handler(update: Update, context: ContextTypes.DEFAULT_T
     db("UPDATE withdrawals SET status = 'paid' WHERE id = ?", (wid,))
     await update.message.reply_text(f"✅ Retrait {wid} marqué comme payé.")
 
-# ------------- TEXT HANDLER -------------
+# ---------------- TEXT HANDLER ----------------
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user = update.effective_user
     ensure_user_record(user)
     row = get_user_row(user.id)
-    # save MM if looks like a phone number and not set yet
     if row and (row[5] is None) and text.replace("+","").replace(" ","").isdigit() and 6 <= len(text) <= 15:
         set_mm_number(user.id, text)
         await update.message.reply_text(f"✅ Numéro Mobile Money enregistré : {text}")
         return
     await update.message.reply_text("Commande non reconnue. Utilise /help pour la liste des commandes.")
 
-# ------------- REGISTER HANDLERS -------------
+# ---------------- REGISTER HANDLERS ----------------
 application.add_handler(CommandHandler("start", start_handler))
 application.add_handler(CommandHandler("achat", achat_handler))
 application.add_handler(CommandHandler("confirm_purchase", confirm_purchase_handler))
@@ -391,44 +396,45 @@ application.add_handler(CommandHandler("pay_withdrawal", pay_withdrawal_handler)
 
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-# === START TELEGRAM APP IN BACKGROUND (safe for Gunicorn) ===
+# ---------------- START TELEGRAM APP IN BACKGROUND ----------------
 def _start_telegram_app_in_background():
     def _runner():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(application.initialize())
         loop.run_until_complete(application.start())
-        logging.info("✅ Application (telegram) started in background loop")
+        logger.info("✅ Telegram Application started in background loop")
         loop.run_forever()
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
 
 _start_telegram_app_in_background()
 
-# ------------- WEBHOOK -------------
+# ---------------- WEBHOOK (TRACE + QUEUE) ----------------
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook_endpoint():
     try:
         data = request.get_json(force=True)
-        logging.info("➡️ Données reçues du webhook : %s", data)
+        # TRACE: show full JSON payload in logs for debugging
+        logger.debug("➡️ Webhook payload (raw): %s", data)
         update = Update.de_json(data, bot)
         application.update_queue.put_nowait(update)
     except Exception:
-        logging.exception("Error processing update")
+        logger.exception("Error processing update")
         return "error", 500
     return "ok", 200
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "ok", "service": "MoneyToFlows", "version": "stable-14"})
+    return jsonify({"status": "ok", "service": "MoneyToFlows", "version": "v15"}), 200
 
-# ------------- MAIN (local run) -------------
+# ---------------- MAIN (local run) ----------------
 if __name__ == "__main__":
     try:
         url = f"{WEBHOOK_HOSTNAME}/{TOKEN}"
         bot.set_webhook(url=url)
-        logging.info("Webhook défini automatiquement : %s", url)
+        logger.info("Webhook set: %s", url)
     except Exception:
-        logging.exception("Impossible de définir le webhook automatiquement.")
+        logger.exception("Could not set webhook automatically.")
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
