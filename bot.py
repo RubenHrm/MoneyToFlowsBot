@@ -1,4 +1,4 @@
-# bot.py — MoneyToFlows (v13 complet, stable pour Render)
+# bot.py — MoneyToFlows v14 (complet, prêt pour Render)
 import os
 import sqlite3
 import threading
@@ -7,24 +7,32 @@ import logging
 from datetime import datetime
 from flask import Flask, request, jsonify
 from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = "https://moneytoflowsbot-13.onrender.com"  # <-- change si tu renommes le service
+WEBHOOK_HOSTNAME = "https://moneytoflowsbot-14.onrender.com"  # adapte si tu renommes le service
 ADMIN_USERNAME = "RUBENHRM777"  # ton @ sans @
 PRODUCT_PRICE = 5000  # FCFA (modifiable)
 DB_FILE = "data.db"
 
 if not TOKEN:
-    raise RuntimeError("La variable d'environnement BOT_TOKEN n'est pas définie.")
+    raise RuntimeError("La variable d'environnement BOT_TOKEN n'est pas définie. Met-la dans Render > Environment variables.")
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logging.info("Démarrage MoneyToFlows v13...")
+logging.info("▶ Démarrage MoneyToFlows v14...")
 
-# Flask & bot
+# Flask app
 app = Flask(__name__)
+
+# Telegram bot & application
 bot = Bot(token=TOKEN)
 application = Application.builder().token(TOKEN).build()
 
@@ -85,7 +93,6 @@ def db(query, params=(), fetch=False):
     conn.close()
     return rows
 
-# initialise DB maintenant
 init_db()
 
 # --------------- HELPERS ----------------
@@ -95,7 +102,11 @@ def ensure_user_record(user):
            (user.id, user.username or "", user.first_name or "", datetime.utcnow().isoformat()))
 
 def get_user_row(user_id):
-    rows = db("SELECT user_id, username, first_name, parrain_id, registered_at, mm_number, is_admin FROM users WHERE user_id = ?", (user_id,), fetch=True)
+    rows = db(
+        "SELECT user_id, username, first_name, parrain_id, registered_at, mm_number, is_admin FROM users WHERE user_id = ?",
+        (user_id,),
+        fetch=True,
+    )
     return rows[0] if rows else None
 
 def set_parrain(child_id, parrain_id):
@@ -131,7 +142,6 @@ def credit_parrain_for_buyer(buyer_id):
     if not row or not row[0][0]:
         return None
     parrain_id = row[0][0]
-    # compute after validation (caller must mark validated)
     acheteurs = count_validated_acheteurs(parrain_id)
     pct = compute_pct(acheteurs)
     amount = int(PRODUCT_PRICE * pct)
@@ -158,7 +168,6 @@ def set_mm_number(user_id, mm):
 def create_withdrawal(user_id, amount, mm):
     db("INSERT INTO withdrawals (user_id, amount, mm_number, status, created_at) VALUES (?, ?, ?, ?, ?)",
        (user_id, amount, mm, "pending", datetime.utcnow().isoformat()))
-    # mark earnings as paid to avoid duplicate requests
     db("UPDATE earnings SET paid = 1 WHERE user_id = ?", (user_id,))
 
 # -------------- HANDLERS --------------
@@ -166,7 +175,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user_record(user)
 
-    # parse deep-link: accepts "ref_123" or plain digits
+    # deep link parser
     parrain_id = None
     if context.args:
         arg = context.args[0]
@@ -201,7 +210,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def achat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🛒 Lien d'achat officiel:\nhttps://sgzxfbtn.mychariow.shop/prd_8ind83\n\nAprès achat, envoie la référence avec /confirm_purchase <REFERENCE>.")
+    await update.message.reply_text(
+        "🛒 Lien d'achat officiel:\nhttps://sgzxfbtn.mychariow.shop/prd_8ind83\n\n"
+        "Après achat, envoie la référence avec /confirm_purchase <REFERENCE>."
+    )
 
 async def confirm_purchase_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -386,11 +398,11 @@ def _start_telegram_app_in_background():
         asyncio.set_event_loop(loop)
         loop.run_until_complete(application.initialize())
         loop.run_until_complete(application.start())
+        logging.info("✅ Application (telegram) started in background loop")
         loop.run_forever()
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
 
-# start app background worker so update_queue is processed
 _start_telegram_app_in_background()
 
 # ------------- WEBHOOK -------------
@@ -398,10 +410,8 @@ _start_telegram_app_in_background()
 def webhook_endpoint():
     try:
         data = request.get_json(force=True)
-        logging.info("Webhook received")
         logging.info("➡️ Données reçues du webhook : %s", data)
         update = Update.de_json(data, bot)
-        # push into application queue for processing by the background app
         application.update_queue.put_nowait(update)
     except Exception:
         logging.exception("Error processing update")
@@ -410,14 +420,15 @@ def webhook_endpoint():
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "ok", "service": "MoneyToFlows", "version": "stable-13"})
+    return jsonify({"status": "ok", "service": "MoneyToFlows", "version": "stable-14"})
 
 # ------------- MAIN (local run) -------------
 if __name__ == "__main__":
     try:
-        bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
-        logging.info("Webhook set successfully.")
+        url = f"{WEBHOOK_HOSTNAME}/{TOKEN}"
+        bot.set_webhook(url=url)
+        logging.info("Webhook défini automatiquement : %s", url)
     except Exception:
-        logging.exception("Could not set webhook automatically.")
+        logging.exception("Impossible de définir le webhook automatiquement.")
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
