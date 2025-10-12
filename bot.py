@@ -1,470 +1,456 @@
-# bot.py — MoneyToFlows v20 (final : webhook fixed + full MLM + admin + data.json)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Bot Telegram - Parrainage / MLM (V21)
+- Compatible python-telegram-bot==21.4
+- Gère parrainage, dashboard, demande de retrait Mobile Money, et commandes admin.
+"""
+
 import os
-import json
-import threading
-import asyncio
+import re
 import logging
+import sqlite3
 from datetime import datetime
-from flask import Flask, request, jsonify
+from typing import Optional, Tuple
+
 from telegram import Update
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     filters,
-    ContextTypes
+    ContextTypes,
 )
 
 # ---------------- CONFIG ----------------
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("TOKEN")  # OBLIGATOIRE (Render Environment)
+ADMIN_ID = os.getenv("ADMIN_ID")  # optionnel: met ton ID numérique si tu veux
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@RUBENHRM777")  # fallback
+ACHAT_LINK = os.getenv("ACHAT_LINK", "https://sgzxfbtn.mychariow.shop/prd_8ind83")
+PRODUCT_NAME = os.getenv("PRODUCT_NAME", "Pack Formations Business 2026")
+SEUIL_RECOMPENSE = int(os.getenv("SEUIL_RECOMPENSE", "5"))
+DB_FILE = os.getenv("DB_FILE", "referral_bot.db")
+PHONE_REGEX = re.compile(r"^\+?\d{6,15}$")  # accepté: +231..., 069xxxxxx, etc.
+# ----------------------------------------
+
 if not TOKEN:
-    raise RuntimeError("BOT_TOKEN not set in environment (Render > Environment variables).")
+    raise RuntimeError("La variable d'environnement TOKEN n'est pas définie. Ajoute-la sur Render.")
 
-WEBHOOK_HOSTNAME = os.getenv("WEBHOOK_HOSTNAME", "https://moneytoflowsbot-19.onrender.com")
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "RUBENHRM777")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # numeric id, set in Render env
-PRODUCT_PRICE = int(os.getenv("PRODUCT_PRICE", "5000"))  # FCFA
-MIN_FILLEULS_FOR_WITHDRAW = int(os.getenv("MIN_FILLEULS_FOR_WITHDRAW", "5"))
-DATA_FILE = os.getenv("DATA_FILE", "data.json")
-DATA_LOCK = threading.Lock()
+# Convert ADMIN_ID to int if present
+if ADMIN_ID:
+    try:
+        ADMIN_ID = int(ADMIN_ID)
+    except:
+        ADMIN_ID = None
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s - %(message)s", level=logging.DEBUG)
-logger = logging.getLogger("moneytoflows-v20")
+# Logging
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ---------------- FLASK & TELEGRAM APP ----------------
-app = Flask(__name__)
-application = Application.builder().token(TOKEN).build()
+# ---------------- DATABASE HELPERS ----------------
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        telegram_id INTEGER PRIMARY KEY,
+        username TEXT,
+        ref_code TEXT UNIQUE,
+        referrer_code TEXT,
+        purchases INTEGER DEFAULT 0,
+        created_at TEXT
+    );
 
-# ---------------- data.json helpers ----------------
-def default_data():
-    return {
-        "users": {},          # user_id -> {...}
-        "purchases": {},      # purchase_id -> {...}
-        "earnings": {},       # earning_id -> {...}
-        "withdrawals": {},    # withdrawal_id -> {...}
-        "counters": {"purchase_id": 0, "earning_id": 0, "withdrawal_id": 0}
-    }
+    CREATE TABLE IF NOT EXISTS referrals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_code TEXT,
+        referred_telegram_id INTEGER,
+        referred_username TEXT,
+        joined_at TEXT
+    );
 
-def load_data():
-    with DATA_LOCK:
-        if not os.path.exists(DATA_FILE):
-            d = default_data()
-            with open(DATA_FILE, "w", encoding="utf-8") as f:
-                json.dump(d, f, ensure_ascii=False, indent=2)
-            return d
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+    CREATE TABLE IF NOT EXISTS withdrawals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER,
+        mobile_number TEXT,
+        status TEXT DEFAULT 'pending', -- pending | validated | refused
+        created_at TEXT
+    );
+    """)
+    conn.commit()
+    conn.close()
 
-def save_data(d):
-    with DATA_LOCK:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
+def db_execute(query: str, params: tuple = (), fetch: bool = False):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(query, params)
+    if fetch:
+        rows = c.fetchall()
+        conn.commit()
+        conn.close()
+        return rows
+    conn.commit()
+    conn.close()
+    return None
 
-# initialize file
-data = load_data()
-logger.info("✅ data.json initialized (v20)")
+# --- user utilities ---
+def get_user_by_telegram(telegram_id: int) -> Optional[tuple]:
+    rows = db_execute("SELECT telegram_id, username, ref_code, referrer_code, purchases, created_at FROM users WHERE telegram_id = ?", (telegram_id,), True)
+    return rows[0] if rows else None
 
-# ---------------- core helpers ----------------
-def ensure_user(user_obj):
-    d = load_data()
-    uid = str(user_obj.id)
-    if uid not in d["users"]:
-        d["users"][uid] = {
-            "user_id": user_obj.id,
-            "username": user_obj.username or "",
-            "first_name": user_obj.first_name or "",
-            "parrain_id": None,
-            "registered_at": datetime.utcnow().isoformat(),
-            "mm_number": None,
-            "is_admin": False
-        }
-        save_data(d)
-    return d["users"][uid]
+def get_user_by_code(code: str) -> Optional[tuple]:
+    rows = db_execute("SELECT telegram_id, username, ref_code FROM users WHERE ref_code = ?", (code,), True)
+    return rows[0] if rows else None
 
-def get_user(user_id):
-    d = load_data()
-    return d["users"].get(str(user_id))
+def create_user(telegram_id: int, username: str, referrer_code: Optional[str] = None) -> tuple:
+    # generate simple unique ref_code
+    code = f"r{telegram_id:x}"[-8:]
+    created_at = datetime.utcnow().isoformat()
+    db_execute("INSERT OR IGNORE INTO users (telegram_id, username, ref_code, referrer_code, purchases, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+               (telegram_id, username, code, referrer_code, created_at))
+    return get_user_by_telegram(telegram_id)
 
-def set_parrain(child_id, parrain_id):
-    d = load_data()
-    u = d["users"].get(str(child_id))
-    if u and u.get("parrain_id") is None:
-        u["parrain_id"] = parrain_id
-        save_data(d)
-        return True
+def add_referral(referrer_code: str, referred_telegram_id: int, referred_username: str):
+    db_execute("INSERT INTO referrals (referrer_code, referred_telegram_id, referred_username, joined_at) VALUES (?, ?, ?, ?)",
+               (referrer_code, referred_telegram_id, referred_username, datetime.utcnow().isoformat()))
+
+def count_referred(referrer_code: str) -> int:
+    rows = db_execute("SELECT COUNT(*) FROM referrals WHERE referrer_code = ?", (referrer_code,), True)
+    return rows[0][0] if rows else 0
+
+def count_referred_with_purchase(referrer_code: str) -> int:
+    rows = db_execute(
+        "SELECT COUNT(*) FROM referrals r JOIN users u ON r.referred_telegram_id = u.telegram_id WHERE r.referrer_code = ? AND u.purchases > 0",
+        (referrer_code,), True
+    )
+    return rows[0][0] if rows else 0
+
+def increment_purchase(telegram_id: int):
+    db_execute("UPDATE users SET purchases = purchases + 1 WHERE telegram_id = ?", (telegram_id,))
+
+def create_withdrawal_request(telegram_id: int, mobile_number: str):
+    db_execute("INSERT INTO withdrawals (telegram_id, mobile_number, status, created_at) VALUES (?, ?, 'pending', ?)",
+               (telegram_id, mobile_number, datetime.utcnow().isoformat()))
+
+def list_withdrawals(status_filter: Optional[str] = None) -> list:
+    if status_filter:
+        return db_execute("SELECT id, telegram_id, mobile_number, status, created_at FROM withdrawals WHERE status = ? ORDER BY created_at DESC", (status_filter,), True) or []
+    return db_execute("SELECT id, telegram_id, mobile_number, status, created_at FROM withdrawals ORDER BY created_at DESC", (), True) or []
+
+def set_withdrawal_status(withdrawal_id: int, status: str):
+    db_execute("UPDATE withdrawals SET status = ? WHERE id = ?", (status, withdrawal_id))
+
+# ---------------- HELPERS ----------------
+def is_admin_user(user) -> bool:
+    try:
+        if ADMIN_ID and hasattr(user, "id") and user.id == ADMIN_ID:
+            return True
+        # compare username (without @)
+        if hasattr(user, "username") and user.username:
+            u = user.username.lower()
+            admin_name = ADMIN_USERNAME.lstrip("@").lower()
+            if u == admin_name:
+                return True
+    except Exception:
+        pass
     return False
 
-def add_purchase(user_id, reference):
-    d = load_data()
-    pid = d["counters"]["purchase_id"] + 1
-    d["counters"]["purchase_id"] = pid
-    d["purchases"][str(pid)] = {"user_id": user_id, "reference": reference, "validated": False, "validated_at": None}
-    save_data(d)
-    return pid
-
-def validate_purchase_record(pid):
-    d = load_data()
-    p = d["purchases"].get(str(pid))
-    if not p:
-        return False, "purchase not found"
-    if p["validated"]:
-        return False, "already validated"
-    p["validated"] = True
-    p["validated_at"] = datetime.utcnow().isoformat()
-    save_data(d)
-    # credit parrain
-    amt = credit_parrain_for_buyer(p["user_id"])
-    return True, amt
-
-def compute_pct(n):
-    if n >= 100:
-        return 0.40
-    if n >= 50:
-        return 0.30
-    return 0.20
-
-def count_validated_buyers(parrain_id):
-    d = load_data()
-    cnt = 0
-    for p in d["purchases"].values():
-        if p["validated"]:
-            buyer = d["users"].get(str(p["user_id"]))
-            if buyer and buyer.get("parrain_id") == parrain_id:
-                cnt += 1
-    return cnt
-
-def credit_parrain_for_buyer(buyer_id):
-    d = load_data()
-    buyer = d["users"].get(str(buyer_id))
-    if not buyer:
-        return None
-    parrain = buyer.get("parrain_id")
-    if not parrain:
-        return None
-    acheteurs = count_validated_buyers(parrain)
-    pct = compute_pct(acheteurs)
-    amount = int(PRODUCT_PRICE * pct)
-    eid = d["counters"]["earning_id"] + 1
-    d["counters"]["earning_id"] = eid
-    d["earnings"][str(eid)] = {"user_id": parrain, "amount": amount, "source_user_id": buyer_id, "created_at": datetime.utcnow().isoformat(), "paid": False}
-    save_data(d)
-    # Notify parrain and admin if threshold reached
-    if acheteurs >= MIN_FILLEULS_FOR_WITHDRAW:
-        u = d["users"].get(str(parrain))
-        mm = u.get("mm_number") if u else None
-        if not mm:
-            try:
-                asyncio.create_task(application.bot.send_message(chat_id=parrain, text=(
-                    f"🎉 Tu as atteint {acheteurs} filleuls acheteurs validés. Enregistre ton numéro Mobile Money avec /setmm <numero> pour recevoir tes gains."
-                )))
-            except Exception:
-                logger.exception("notify parrain")
-        notify_admins(f"Parrain {parrain} has {acheteurs} acheteurs validés. New earning: {amount} FCFA. MM: {mm or '(not set)'}")
-    return amount
-
-def get_stats_parrain(user_id):
-    d = load_data()
-    total_filleuls = sum(1 for u in d["users"].values() if u.get("parrain_id") == user_id)
-    acheteurs = count_validated_buyers(user_id)
-    pending = sum(e["amount"] for e in d["earnings"].values() if e["user_id"] == user_id and not e["paid"])
-    total = sum(e["amount"] for e in d["earnings"].values() if e["user_id"] == user_id)
-    pct = int(compute_pct(acheteurs) * 100)
-    return {"total_filleuls": total_filleuls, "acheteurs": acheteurs, "pending": pending, "total": total, "pct": pct}
-
-def set_mm(user_id, mm):
-    d = load_data()
-    u = d["users"].get(str(user_id))
-    if u:
-        u["mm_number"] = mm
-        # create withdrawal if pending earnings
-        pending = sum(e["amount"] for e in d["earnings"].values() if e["user_id"] == user_id and not e["paid"])
-        if pending > 0:
-            wid = d["counters"]["withdrawal_id"] + 1
-            d["counters"]["withdrawal_id"] = wid
-            d["withdrawals"][str(wid)] = {"user_id": user_id, "amount": pending, "mm_number": mm, "status": "pending", "created_at": datetime.utcnow().isoformat()}
-            # mark earnings as paid (prevent dup req)
-            for e in d["earnings"].values():
-                if e["user_id"] == user_id and not e["paid"]:
-                    e["paid"] = True
-            notify_admins(f"Auto withdrawal created for {user_id}: {pending} FCFA (mm {mm})")
-        save_data(d)
-
-def create_withdrawal(user_id, amount, mm):
-    d = load_data()
-    wid = d["counters"]["withdrawal_id"] + 1
-    d["counters"]["withdrawal_id"] = wid
-    d["withdrawals"][str(wid)] = {"user_id": user_id, "amount": amount, "mm_number": mm, "status": "pending", "created_at": datetime.utcnow().isoformat()}
-    # mark earnings as paid
-    for e in d["earnings"].values():
-        if e["user_id"] == user_id and not e["paid"]:
-            e["paid"] = True
-    save_data(d)
-    notify_admins(f"User {user_id} requested withdrawal {amount} FCFA (mm {mm})")
-    return wid
-
-def notify_admins(msg):
-    d = load_data()
-    ids = set()
-    if ADMIN_ID:
-        ids.add(ADMIN_ID)
-    for uid, u in d["users"].items():
-        if u.get("is_admin"):
-            try:
-                ids.add(int(u["user_id"]))
-            except:
-                pass
-        if (u.get("username") or "").lower() == ADMIN_USERNAME.lower():
-            try:
-                ids.add(int(u["user_id"]))
-            except:
-                pass
-    for aid in ids:
-        try:
-            asyncio.create_task(application.bot.send_message(chat_id=aid, text=msg))
-        except Exception:
-            logger.exception("notify_admins failed")
-
 # ---------------- HANDLERS ----------------
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    ensure_user(user)
-    # parse deep link (context.args provided by PTB)
-    parrain_id = None
-    if context.args:
-        arg = context.args[0]
-        if isinstance(arg, str):
-            if arg.startswith("ref_"):
+    args = context.args
+    payload = args[0] if args else None
+    referrer_code = None
+    if payload and payload.startswith("ref_"):
+        referrer_code = payload.split("ref_", 1)[1]
+    # create user if not exists
+    if not get_user_by_telegram(user.id):
+        create_user(user.id, user.username or (user.full_name if hasattr(user, "full_name") else str(user.id)), referrer_code)
+        if referrer_code:
+            add_referral(referrer_code, user.id, user.username or user.first_name or "")
+            # notify parrain if possible
+            ref = get_user_by_code(referrer_code)
+            if ref:
                 try:
-                    parrain_id = int(arg.split("ref_")[1])
-                except:
-                    parrain_id = None
-            elif arg.isdigit():
-                parrain_id = int(arg)
-    if parrain_id and parrain_id != user.id:
-        changed = set_parrain(user.id, parrain_id)
-        if changed:
-            try:
-                await context.bot.send_message(parrain_id, f"🎉 Nouveau filleul inscrit : @{user.username or user.first_name} (ID {user.id})")
-            except Exception:
-                logger.exception("notify parrain on signup")
+                    await context.bot.send_message(chat_id=ref[0], text=f"🎉 Nouveau filleul ! @{user.username or user.first_name} s'est inscrit via ton lien.")
+                except Exception:
+                    pass
+    # welcome text
+    await update.message.reply_text(
+        f"👋 Bonjour {user.first_name} !\n\n"
+        f"Tu es sur le bot *{PRODUCT_NAME}*.\n\n"
+        "Commandes utiles :\n"
+        "/achat → Lien d'achat\n"
+        "/parrainage → Obtenir ton lien unique\n"
+        "/dashboard → Voir ton tableau de bord\n"
+        "/retrait → Demander un retrait (après 5 filleuls acheteurs)\n"
+        "/aide → Assistance\n"
+    )
 
-    # generate referral link
+async def achat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🛍️ Voici le lien officiel pour acheter *{PRODUCT_NAME}* :\n{ACHAT_LINK}\n\n"
+        "Après ton achat, utilise /confachat <REFERENCE> pour envoyer ta preuve (admin validera)."
+    )
+
+async def parrainage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    u = get_user_by_telegram(user.id) or create_user(user.id, user.username or user.full_name or str(user.id))
+    ref_code = u[2]
+    deep_link = f"https://t.me/{context.bot.username}?start=ref_{ref_code}"
+    await update.message.reply_text(
+        f"🔗 Ton lien de parrainage :\n{deep_link}\n\n"
+        f"⚠️ Rappel : le retrait est disponible uniquement après {SEUIL_RECOMPENSE} filleuls acheteurs."
+    )
+
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    u = get_user_by_telegram(user.id)
+    if not u:
+        await update.message.reply_text("Tu n'es pas encore enregistré. Fais /start.")
+        return
+    code = u[2]
+    total = count_referred(code)
+    acheteurs = count_referred_with_purchase(code)
+    eligible = acheteurs >= SEUIL_RECOMPENSE
+    await update.message.reply_text(
+        f"📊 TABLEAU DE BORD\n\n"
+        f"👤 @{user.username}\n"
+        f"🔗 Code : {code}\n"
+        f"👥 Filleuls inscrits : {total}\n"
+        f"🛒 Filleuls acheteurs : {acheteurs}\n"
+        f"🏆 Éligible au retrait : {'✅ OUI' if eligible else f'❌ NON (encore {SEUIL_RECOMPENSE - acheteurs})'}\n\n"
+        f"⚠️ Le retrait se débloque à {SEUIL_RECOMPENSE} filleuls acheteurs.\n"
+        "Pour demander un retrait : /retrait"
+    )
+
+async def confachat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Usage: /confachat <REFERENCE>
+    user = update.effective_user
+    if not context.args:
+        await update.message.reply_text("Usage: /confachat <REFERENCE>")
+        return
+    reference = context.args[0]
+    # Notify admin with the reference for manual validation
+    admin_text = f"🔔 Demande de validation d'achat : @{user.username or user.first_name} (ID:{user.id})\nRéf: {reference}\nUtilise /addpurchase <telegram_id> pour valider."
     try:
-        bot_username = (await context.bot.get_me()).username
+        if ADMIN_ID:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text)
+        else:
+            await context.bot.send_message(chat_id=ADMIN_USERNAME, text=admin_text)
     except Exception:
-        bot_username = "MoneyToFlowsBot"
-    link = f"https://t.me/{bot_username}?start=ref_{user.id}"
+        pass
+    await update.message.reply_text("✅ Ta demande a été envoyée à l'admin pour validation.")
 
+# ---------------- RETRAIT FLOW ----------------
+async def retrait(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    u = get_user_by_telegram(user.id)
+    if not u:
+        await update.message.reply_text("Tu n'es pas enregistré. Fais /start d'abord.")
+        return
+    code = u[2]
+    acheteurs = count_referred_with_purchase(code)
+    if acheteurs < SEUIL_RECOMPENSE:
+        await update.message.reply_text(f"🚫 Tu as {acheteurs} filleuls acheteurs. Il en faut {SEUIL_RECOMPENSE} pour débloquer le retrait.")
+        return
+    # ask for mobile number
+    db_execute("DELETE FROM withdrawals WHERE telegram_id = ? AND status = 'waiting_number'", (user.id,))
+    db_execute("INSERT INTO withdrawals (telegram_id, mobile_number, status, created_at) VALUES (?, ?, 'waiting_number', ?)",
+               (user.id, '', datetime.utcnow().isoformat()))
     await update.message.reply_text(
-        f"👋 Salut {user.first_name} !\n\nBienvenue dans MoneyToFlows 🤑💸\n\n🔗 Ton lien de parrainage : {link}\n\nCommandes : /achat /confirm_purchase <ref> /parrainage /dashboard /setmm /retrait /help"
+        "✅ Tu es éligible au retrait.\n"
+        "Envoie maintenant ton numéro Mobile Money (ex: +2426xxxxxxxx ou 06xxxxxxxx) pour que nous puissions créer ta demande."
     )
 
-async def achat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🛒 Lien d'achat officiel:\nhttps://sgzxfbtn.mychariow.shop/prd_8ind83\n\nAprès achat, envoie la référence avec /confirm_purchase <REFERENCE>.")
-
-async def confirm_purchase_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# capture messages that look like phone numbers and match waiting entries
+async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
     user = update.effective_user
-    if not context.args:
-        await update.message.reply_text("Usage: /confirm_purchase <REFERENCE>")
+    # check if user has a withdrawal waiting for number
+    rows = db_execute("SELECT id FROM withdrawals WHERE telegram_id = ? AND status = 'waiting_number'", (user.id,), True)
+    if rows:
+        # expects phone number
+        if PHONE_REGEX.match(text):
+            # update withdrawal
+            db_execute("UPDATE withdrawals SET mobile_number = ?, status = 'pending' WHERE id = ?", (text, rows[0][0]))
+            await update.message.reply_text("✅ Ton numéro a bien été reçu. Ta demande de retrait a été envoyée à l'admin pour validation.")
+            # notify admin
+            admin_text = f"🔔 Nouvelle demande de retrait : @{user.username or user.first_name} (ID:{user.id})\nNuméro: {text}\nUtilise /valider_retrait <withdrawal_id> pour valider."
+            # send the admin the withdrawal id too
+            w = db_execute("SELECT id FROM withdrawals WHERE telegram_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1", (user.id,), True)
+            wid = w[0][0] if w else None
+            if wid:
+                admin_text = f"🔔 Nouvelle demande de retrait (id:{wid}) : @{user.username or user.first_name} (ID:{user.id})\nNuméro: {text}\nValide: /valider_retrait {wid}\nRefuser: /refuser_retrait {wid}"
+            try:
+                if ADMIN_ID:
+                    await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text)
+                else:
+                    await context.bot.send_message(chat_id=ADMIN_USERNAME, text=admin_text)
+            except Exception:
+                pass
+        else:
+            # not a phone number
+            await update.message.reply_text("❌ Numéro non reconnu. Envoie ton numéro Mobile Money au format 06xxxxxxxx ou +2426xxxxxxxx.")
+    else:
+        # ignore or help
+        # you can keep generic fallback or ignore
         return
-    ref = context.args[0]
-    ensure_user(user)
-    pid = add_purchase(user.id, ref)
-    await update.message.reply_text(f"✅ Référence reçue (purchase_id: {pid}). L'admin la validera sous peu.")
-    notify_admins(f"Nouvelle référence à valider : user {user.id} / @{user.username} / ref: {ref} (purchase_id: {pid})")
 
-async def parrainage_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user)
-    try:
-        bot_username = (await context.bot.get_me()).username
-    except:
-        bot_username = "MoneyToFlowsBot"
-    link = f"https://t.me/{bot_username}?start=ref_{user.id}"
-    await update.message.reply_text(f"💸 Ton lien de parrainage :\n{link}")
-
-async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user)
-    stats = get_stats_parrain(user.id)
+# ---------------- ADMIN COMMANDS ----------------
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user):
+        await update.message.reply_text("Commande réservée à l'admin.")
+        return
+    rows = db_execute("SELECT COUNT(*) FROM users", (), True) or [[0]]
+    total_users = rows[0][0]
+    rows2 = db_execute("SELECT COUNT(*) FROM users WHERE purchases>0", (), True) or [[0]]
+    total_buyers = rows2[0][0]
+    rows3 = db_execute("SELECT COUNT(*) FROM referrals", (), True) or [[0]]
+    total_referrals = rows3[0][0]
+    rows4 = db_execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'", (), True) or [[0]]
+    pending_withdrawals = rows4[0][0]
     await update.message.reply_text(
-        f"📊 Tableau de bord\n\n👥 Filleuls inscrits : {stats['total_filleuls']}\n🛒 Filleuls acheteurs validés : {stats['acheteurs']}\n💰 Gains totaux : {int(stats['total'])} FCFA\n💵 Solde disponible : {int(stats['pending'])} FCFA\n🔖 Taux actuel : {stats['pct']}%\n\n🔔 Seuil retrait : {MIN_FILLEULS_FOR_WITHDRAW} filleuls acheteurs"
+        f"📈 STATS ADMIN\nMembres: {total_users}\nAcheteurs: {total_buyers}\nReferrals: {total_referrals}\nRetraits en attente: {pending_withdrawals}"
     )
 
-async def setmm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not context.args:
-        await update.message.reply_text("Usage: /setmm <numero_mobile>")
+async def addpurchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /addpurchase <telegram_id>
+    if not is_admin_user(update.effective_user):
+        await update.message.reply_text("Commande admin seulement.")
         return
-    mm = context.args[0]
-    ensure_user(user)
-    set_mm(user.id, mm)
-    await update.message.reply_text(f"✅ Numéro Mobile Money enregistré : {mm}")
-
-async def retrait_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user)
-    stats = get_stats_parrain(user.id)
-    if stats["acheteurs"] < MIN_FILLEULS_FOR_WITHDRAW:
-        await update.message.reply_text(f"🚫 Il te faut au moins {MIN_FILLEULS_FOR_WITHDRAW} filleuls acheteurs validés. Actuels : {stats['acheteurs']}/{MIN_FILLEULS_FOR_WITHDRAW}")
-        return
-    row = get_user(user.id)
-    mm = row.get("mm_number") if row else None
-    if not mm:
-        await update.message.reply_text("📲 Enregistre ton numéro Mobile Money avec /setmm <numero> avant de demander le retrait.")
-        return
-    amount = int(stats["pending"])
-    if amount <= 0:
-        await update.message.reply_text("Tu n'as pas de solde disponible pour retrait.")
-        return
-    wid = create_withdrawal(user.id, amount, mm)
-    await update.message.reply_text(f"✅ Demande de retrait enregistrée (ID {wid}) pour {amount} FCFA. L'admin te contactera.")
-
-# ---------------- ADMIN ----------------
-async def admin_register_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if (user.username or "").lower() != ADMIN_USERNAME.lower() and (ADMIN_ID and user.id != ADMIN_ID):
-        await update.message.reply_text("❌ Commande réservée à l'administrateur.")
-        return
-    ensure_user(user)
-    d = load_data()
-    d["users"][str(user.id)]["is_admin"] = True
-    save_data(d)
-    await update.message.reply_text("✅ Vous êtes enregistré comme administrateur du bot.")
-
-async def validate_purchase_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if (user.username or "").lower() != ADMIN_USERNAME.lower() and (ADMIN_ID and user.id != ADMIN_ID):
-        await update.message.reply_text("❌ Commande réservée à l'admin.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /validate_purchase <purchase_id>")
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text("Usage : /addpurchase <telegram_id>")
         return
     try:
-        pid = int(context.args[0])
+        tid = int(context.args[0])
     except:
-        await update.message.reply_text("L'ID doit être un nombre.")
+        await update.message.reply_text("ID Telegram invalide.")
         return
-    ok, res = validate_purchase_record(pid)
-    if not ok:
-        await update.message.reply_text(f"Erreur: {res}")
-        return
-    amt = res or 0
-    await update.message.reply_text(f"Achat validé. Parrain crédité: {int(amt)} FCFA (si un parrain existait).")
+    increment_purchase(tid)
+    # notify referrer(s)
+    user = get_user_by_telegram(tid)
+    if user and user[3]:
+        ref_code = user[3]
+        ref_user = get_user_by_code(ref_code)
+        if ref_user:
+            try:
+                await context.bot.send_message(chat_id=ref_user[0], text=f"✅ Ton filleul @{user[1]} a acheté le produit. Ta progression augmente.")
+            except Exception:
+                pass
+    await update.message.reply_text("✅ Achat enregistré.")
 
-async def stats_admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if (user.username or "").lower() != ADMIN_USERNAME.lower() and (ADMIN_ID and user.id != ADMIN_ID):
-        await update.message.reply_text("❌ Commande réservée à l'admin.")
+async def list_retraits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user):
+        await update.message.reply_text("Commande admin seulement.")
         return
-    d = load_data()
-    total_users = len(d["users"])
-    total_valid_purchases = sum(1 for p in d["purchases"].values() if p["validated"])
-    total_earnings = sum(e["amount"] for e in d["earnings"].values())
-    pending_withdrawals = sum(1 for w in d["withdrawals"].values() if w["status"] == "pending")
-    await update.message.reply_text(
-        f"📈 Stats Admin\n\nUtilisateurs: {total_users}\nAchats validés: {total_valid_purchases}\nGains totaux: {int(total_earnings)} FCFA\nRetraits en attente: {pending_withdrawals}"
-    )
+    rows = list_withdrawals("pending")
+    if not rows:
+        await update.message.reply_text("Aucune demande de retrait en attente.")
+        return
+    txt = "🔔 Retraits en attente :\n"
+    for r in rows:
+        wid, tid, mobile, status, created = r
+        user = get_user_by_telegram(tid)
+        uname = user[1] if user else "unknown"
+        txt += f"id:{wid} - @{uname} (ID:{tid}) - {mobile} - {created}\n"
+    await update.message.reply_text(txt)
 
-async def pay_withdrawal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if (user.username or "").lower() != ADMIN_USERNAME.lower() and (ADMIN_ID and user.id != ADMIN_ID):
-        await update.message.reply_text("❌ Commande réservée à l'admin.")
+async def valider_retrait(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /valider_retrait <withdrawal_id>
+    if not is_admin_user(update.effective_user):
+        await update.message.reply_text("Commande admin seulement.")
         return
-    if not context.args:
-        await update.message.reply_text("Usage: /pay_withdrawal <withdrawal_id>")
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text("Usage : /valider_retrait <withdrawal_id>")
         return
     try:
         wid = int(context.args[0])
     except:
-        await update.message.reply_text("L'ID doit être un nombre.")
+        await update.message.reply_text("ID retrait invalide.")
         return
-    d = load_data()
-    w = d["withdrawals"].get(str(wid))
-    if not w:
-        await update.message.reply_text("Retrait introuvable.")
-        return
-    w["status"] = "paid"
-    save_data(d)
-    await update.message.reply_text(f"✅ Retrait {wid} marqué comme payé.")
+    set_withdrawal_status(wid, "validated")
+    row = db_execute("SELECT telegram_id, mobile_number FROM withdrawals WHERE id = ?", (wid,), True)
+    if row:
+        tid, mobile = row[0]
+        try:
+            await context.bot.send_message(chat_id=tid, text=f"🎉 Ton retrait (id:{wid}) a été validé par l'admin. Nous procéderons au paiement via Mobile Money ({mobile}).")
+        except Exception:
+            pass
+    await update.message.reply_text("✅ Retrait validé et utilisateur notifié.")
 
-# ---------------- TEXT HANDLER ----------------
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    user = update.effective_user
-    ensure_user(user)
-    # Accept phone numbers directly
-    cleaned = text.replace("+", "").replace(" ", "")
-    if cleaned.isdigit() and 6 <= len(cleaned) <= 15:
-        set_mm(user.id, text)
-        await update.message.reply_text(f"✅ Numéro Mobile Money enregistré : {text}")
+async def refuser_retrait(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /refuser_retrait <withdrawal_id> <raison_opt>
+    if not is_admin_user(update.effective_user):
+        await update.message.reply_text("Commande admin seulement.")
         return
-    await update.message.reply_text("Commande non reconnue. Tape /help pour la liste des commandes.")
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text("Usage : /refuser_retrait <withdrawal_id> <raison_opt>")
+        return
+    try:
+        wid = int(context.args[0])
+    except:
+        await update.message.reply_text("ID retrait invalide.")
+        return
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "Aucune raison fournie."
+    set_withdrawal_status(wid, "refused")
+    row = db_execute("SELECT telegram_id FROM withdrawals WHERE id = ?", (wid,), True)
+    if row:
+        tid = row[0][0]
+        try:
+            await context.bot.send_message(chat_id=tid, text=f"❌ Ton retrait (id:{wid}) a été refusé par l'admin.\nRaison: {reason}")
+        except Exception:
+            pass
+    await update.message.reply_text("✅ Retrait refusé et utilisateur notifié.")
+
+async def list_eligibles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user):
+        await update.message.reply_text("Commande admin seulement.")
+        return
+    # list users with >= threshold acheteurs
+    rows = db_execute("SELECT telegram_id, username, ref_code FROM users", (), True) or []
+    res = []
+    for r in rows:
+        tid, uname, code = r
+        cnt = count_referred_with_purchase(code)
+        if cnt >= SEUIL_RECOMPENSE:
+            res.append((tid, uname, code, cnt))
+    if not res:
+        await update.message.reply_text("Aucun eligible pour le moment.")
+        return
+    txt = "💰 Eligibles:\n"
+    for t in res:
+        txt += f"ID:{t[0]} @{t[1]} code:{t[2]} acheteurs:{t[3]}\n"
+    await update.message.reply_text(txt)
 
 # ---------------- REGISTER HANDLERS ----------------
-application.add_handler(CommandHandler("start", start_handler))
-application.add_handler(CommandHandler("achat", achat_handler))
-application.add_handler(CommandHandler("confirm_purchase", confirm_purchase_handler))
-application.add_handler(CommandHandler("parrainage", parrainage_handler))
-application.add_handler(CommandHandler("dashboard", dashboard_handler))
-application.add_handler(CommandHandler("setmm", setmm_handler))
-application.add_handler(CommandHandler("retrait", retrait_handler))
-application.add_handler(CommandHandler("help", start_handler))
+def register_handlers(app):
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("achat", achat))
+    app.add_handler(CommandHandler("parrainage", parrainage))
+    app.add_handler(CommandHandler("dashboard", dashboard))
+    app.add_handler(CommandHandler("confachat", confachat))
+    app.add_handler(CommandHandler("retrait", retrait))
 
-# admin
-application.add_handler(CommandHandler("admin_register", admin_register_handler))
-application.add_handler(CommandHandler("validate_purchase", validate_purchase_handler))
-application.add_handler(CommandHandler("stats_admin", stats_admin_handler))
-application.add_handler(CommandHandler("pay_withdrawal", pay_withdrawal_handler))
+    # admin
+    app.add_handler(CommandHandler("admin_stats", admin_stats))
+    app.add_handler(CommandHandler("addpurchase", addpurchase))
+    app.add_handler(CommandHandler("list_retraits", list_retraits))
+    app.add_handler(CommandHandler("valider_retrait", valider_retrait))
+    app.add_handler(CommandHandler("refuser_retrait", refuser_retrait))
+    app.add_handler(CommandHandler("list_eligibles", list_eligibles_cmd))
 
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    # text handler for capturing mobile numbers when user is expected to send one
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_messages))
 
-# ---------------- START application in background (safe for Gunicorn) ----------------
-def start_app_bg():
-    def runner():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(application.initialize())
-        loop.run_until_complete(application.start())
-        logger.info("✅ Telegram Application started in background loop (v20)")
-        loop.run_forever()
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
+# ---------------- MAIN ----------------
+def main():
+    init_db()
+    app = ApplicationBuilder().token(TOKEN).build()
+    register_handlers(app)
+    logger.info("Bot V21 démarrage (polling)...")
+    print("🤖 Bot V21 démarré (polling).")
+    app.run_polling()
 
-start_app_bg()
-
-# ---------------- WEBHOOK endpoint (fast response to Telegram) ----------------
-@app.route(f"/{TOKEN}", methods=["POST"])
-def webhook_endpoint():
-    try:
-        payload = request.get_json(force=True)
-        logger.debug("➡️ Webhook payload (raw): %s", json.dumps(payload, ensure_ascii=False))
-        update = Update.de_json(payload, application.bot)
-        # enqueue update quickly
-        application.update_queue.put_nowait(update)
-        # return quick positive response to Telegram to avoid timeouts/502
-        return jsonify({"ok": True}), 200
-    except Exception:
-        logger.exception("Error processing update")
-        return jsonify({"ok": False}), 500
-
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"status": "ok", "service": "MoneyToFlows", "version": "v20"}), 200
-
-# ---------------- RUN (local) ----------------
 if __name__ == "__main__":
-    try:
-        url = f"{WEBHOOK_HOSTNAME}/{TOKEN}"
-        async def _set_wh():
-            try:
-                await application.bot.set_webhook(url=url)
-                logger.info("Webhook set automatically: %s", url)
-            except Exception:
-                logger.exception("Could not set webhook automatically.")
-        asyncio.get_event_loop().run_until_complete(_set_wh())
-    except Exception:
-        logger.exception("Webhook automatic set failed.")
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    main()
