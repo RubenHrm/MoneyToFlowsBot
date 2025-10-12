@@ -1,4 +1,4 @@
-# bot.py — MoneyToFlows v17 (final : data.json, MLM+admin, webhook trace + enqueue, app background)
+# bot.py — MoneyToFlows v18 (final)
 import os
 import json
 import threading
@@ -7,16 +7,24 @@ import logging
 from datetime import datetime
 from flask import Flask, request, jsonify
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN not set in environment (Render > Environment variables).")
 
-WEBHOOK_HOSTNAME = os.getenv("WEBHOOK_HOSTNAME", "https://moneytoflowsbot-17.onrender.com")
+# Change if your Render service uses another hostname
+WEBHOOK_HOSTNAME = os.getenv("WEBHOOK_HOSTNAME", "https://moneytoflowsbot-18.onrender.com")
+
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "RUBENHRM777")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # optional numeric telegram id (0 = not set)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # put your numeric Telegram id in Render env if you want
 PRODUCT_PRICE = int(os.getenv("PRODUCT_PRICE", "5000"))
 MIN_FILLEULS_FOR_WITHDRAW = int(os.getenv("MIN_FILLEULS_FOR_WITHDRAW", "5"))
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
@@ -24,17 +32,21 @@ DATA_LOCK = threading.Lock()
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s - %(message)s", level=logging.DEBUG)
-logger = logging.getLogger("moneytoflows-v17")
+logger = logging.getLogger("moneytoflows-v18")
 
-# ---------------- FLASK & TELEGRAM APP ----------------
+# ---------------- FLASK + TELEGRAM app ----------------
 app = Flask(__name__)
-bot = None  # assigned after Application created
+
+# Create application instance (python-telegram-bot)
 application = Application.builder().token(TOKEN).build()
 
-# ---------------- data.json helpers ----------------
+# ---------------- Data (simple JSON) ----------------
 def default_data():
     return {
-        "users": {}, "purchases": {}, "earnings": {}, "withdrawals": {},
+        "users": {},
+        "purchases": {},
+        "earnings": {},
+        "withdrawals": {},
         "counters": {"purchase_id": 0, "earning_id": 0, "withdrawal_id": 0}
     }
 
@@ -53,11 +65,11 @@ def save_data(d):
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=2)
 
-# init file
+# initialize file if missing
 data = load_data()
-logger.info("✅ data.json initialized")
+logger.info("✅ data.json initialized (v18)")
 
-# ---------------- Helper functions (same logic as v16) ----------------
+# ---------------- Helpers (same logic as v16/v17) ----------------
 def ensure_user_record_from_obj(user_obj):
     d = load_data()
     uid = str(user_obj.id)
@@ -90,7 +102,10 @@ def add_purchase_record(user_id, reference):
     pid = d["counters"]["purchase_id"] + 1
     d["counters"]["purchase_id"] = pid
     d["purchases"][str(pid)] = {
-        "user_id": user_id, "reference": reference, "validated": False, "validated_at": None
+        "user_id": user_id,
+        "reference": reference,
+        "validated": False,
+        "validated_at": None
     }
     save_data(d)
     return pid
@@ -127,8 +142,11 @@ def credit_parrain_for_buyer(buyer_id):
     eid = d["counters"]["earning_id"] + 1
     d["counters"]["earning_id"] = eid
     d["earnings"][str(eid)] = {
-        "user_id": parrain, "amount": amount, "source_user_id": buyer_id,
-        "created_at": datetime.utcnow().isoformat(), "paid": False
+        "user_id": parrain,
+        "amount": amount,
+        "source_user_id": buyer_id,
+        "created_at": datetime.utcnow().isoformat(),
+        "paid": False
     }
     save_data(d)
     # notify parrain if reached threshold and mm not set
@@ -137,7 +155,6 @@ def credit_parrain_for_buyer(buyer_id):
         mm = u.get("mm_number") if u else None
         if not mm:
             try:
-                # send message async
                 asyncio.create_task(application.bot.send_message(parrain, text=(
                     f"🎉 Tu as {acheteurs} filleuls acheteurs validés. Enregistre ton numéro Mobile Money avec /setmm <numero> pour recevoir tes gains."
                 )))
@@ -165,15 +182,18 @@ def set_mm_number(user_id, mm):
     u = d["users"].get(str(user_id))
     if u:
         u["mm_number"] = mm
-        # create automatic withdrawal if pending earnings
+        # create auto-withdrawal if pending
         pending = sum(e["amount"] for e in d["earnings"].values() if e["user_id"] == user_id and not e["paid"])
         if pending > 0:
             wid = d["counters"]["withdrawal_id"] + 1
             d["counters"]["withdrawal_id"] = wid
             d["withdrawals"][str(wid)] = {
-                "user_id": user_id, "amount": pending, "mm_number": mm, "status": "pending", "created_at": datetime.utcnow().isoformat()
+                "user_id": user_id,
+                "amount": pending,
+                "mm_number": mm,
+                "status": "pending",
+                "created_at": datetime.utcnow().isoformat()
             }
-            # mark earnings as paid (to avoid duplicates)
             for e in d["earnings"].values():
                 if e["user_id"] == user_id and not e["paid"]:
                     e["paid"] = True
@@ -213,15 +233,14 @@ def notify_admins(message):
         try:
             asyncio.create_task(application.bot.send_message(chat_id=aid, text=message))
         except Exception:
-            logger.exception("notify_admin %s failed", aid)
+            logger.exception("notify_admins failed for %s", aid)
 
-# ---------------- Handlers (user) ----------------
+# ---------------- Handlers (users) ----------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info("Handler /start called for %s (%s)", user.username, user.id)
     ensure_user_record_from_obj(user)
-
-    # parse deep link ref_
+    # parse deep link
     parrain_id = None
     if context.args:
         arg = context.args[0]
@@ -233,7 +252,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parrain_id = None
             elif arg.isdigit():
                 parrain_id = int(arg)
-
     row = get_user_row(user.id)
     if parrain_id and parrain_id != user.id and row and row.get("parrain_id") is None:
         set_parrain(user.id, parrain_id)
@@ -241,15 +259,13 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(parrain_id, f"🎉 Nouveau filleul inscrit : @{user.username or user.first_name}")
         except Exception:
             logger.exception("notify parrain failed")
-
     try:
         bot_username = (await context.bot.get_me()).username
     except Exception:
         bot_username = "MoneyToFlowsBot"
     refer_link = f"https://t.me/{bot_username}?start=ref_{user.id}"
-
     await update.message.reply_text(
-        f"👋 Salut {user.first_name} !\n\nBienvenue dans MoneyToFlows 💸\n\n🔗 Ton lien de parrainage : {refer_link}\n\nCommandes : /achat /confirm_purchase <ref> /parrainage /dashboard /setmm /retrait /help"
+        f"👋 Salut {user.first_name} !\n\nBienvenue dans MoneyToFlows 🤑💸\n\n🔗 Ton lien de parrainage : {refer_link}\n\nCommandes : /achat /confirm_purchase <ref> /parrainage /dashboard /setmm /retrait /help"
     )
 
 async def achat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,7 +401,6 @@ async def pay_withdrawal_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 # ---------------- Text handler ----------------
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # generic text message handler: accept mm number directly if awaiting
     text = update.message.text.strip()
     user = update.effective_user
     ensure_user_record_from_obj(user)
@@ -395,7 +410,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_mm_number(user.id, text)
         await update.message.reply_text(f"✅ Numéro Mobile Money enregistré : {text}")
         return
-    await update.message.reply_text("Commande non reconnue. Utilise /help.")
+    await update.message.reply_text("Commande non reconnue. Utilise /help pour la liste des commandes.")
 
 # ---------------- Register handlers ----------------
 application.add_handler(CommandHandler("start", start_handler))
@@ -414,50 +429,58 @@ application.add_handler(CommandHandler("pay_withdrawal", pay_withdrawal_handler)
 
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-# ---------------- Start Telegram application in background (safe for Gunicorn) ----------------
+# ---------------- Start telegram app in background (safe for Gunicorn) ----------------
 def _start_telegram_app_in_background():
     def _runner():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(application.initialize())
         loop.run_until_complete(application.start())
-        logger.info("✅ Telegram Application started in background loop (v17)")
+        logger.info("✅ Telegram Application started in background loop (v18)")
         loop.run_forever()
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
 
 _start_telegram_app_in_background()
 
-# ---------------- WEBHOOK endpoint (clé déjà incluse) ----------------
+# ---------------- WEBHOOK endpoint (fast response to Telegram to avoid 502) ----------------
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook_endpoint():
     try:
         payload = request.get_json(force=True)
-        # TRACE JSON payload fully (for debugging in Render logs)
+        # trace full payload in logs for debugging
         logger.debug("➡️ Webhook payload (raw): %s", json.dumps(payload, ensure_ascii=False))
-        # Convert to Update and enqueue
+        # convert JSON to Update and enqueue (fast)
         update = Update.de_json(payload, application.bot)
         application.update_queue.put_nowait(update)
-        logger.info("✅ Update enqueued (type: %s)", "message" if "message" in payload else "update")
+        # Return a quick valid JSON 200 response to Telegram to avoid timeouts/502
+        return jsonify({"ok": True}), 200
     except Exception:
         logger.exception("Error processing update")
-        return "error", 500
-    return "ok", 200
+        # return 500 so Telegram logs it as error; but we tried our best
+        return jsonify({"ok": False}), 500
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "ok", "service": "MoneyToFlows", "version": "v17"}), 200
+    return jsonify({"status": "ok", "service": "MoneyToFlows", "version": "v18"}), 200
 
-# ---------------- MAIN (local run / manual webhook set) ----------------
+# ---------------- MAIN ----------------
 if __name__ == "__main__":
+    # try to set webhook automatically when running locally (harmless if already set)
     try:
         url = f"{WEBHOOK_HOSTNAME}/{TOKEN}"
-        # set webhook (won't break if already set)
-        application.bot = application.bot  # ensure
-        bot = application.bot
-        bot.set_webhook(url=url)
-        logger.info("Webhook set automatically (if running locally): %s", url)
+        # set webhook using bot from application
+        app.logger.info("Trying to set webhook automatically to %s", url)
+        # note: application.bot is available after building; use a short async call
+        async def _set_wh():
+            try:
+                await application.bot.set_webhook(url=url)
+                logger.info("Webhook set automatically: %s", url)
+            except Exception:
+                logger.exception("Could not set webhook automatically.")
+        # run it in a new loop only when running as script
+        asyncio.get_event_loop().run_until_complete(_set_wh())
     except Exception:
-        logger.exception("Could not set webhook automatically.")
+        logger.exception("Webhook automatic set failed.")
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
