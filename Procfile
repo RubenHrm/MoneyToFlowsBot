@@ -1,1 +1,1 @@
-web: gunicorn bot:app --timeout 120
+web: gunicorn bot:app_flask
