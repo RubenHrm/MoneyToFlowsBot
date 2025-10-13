@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MoneyToFlowsBot - Railway V21 (complet)
-- MLM / parrainage (chaque filleul a son propre lien)
+MoneyToFlowsBot - Koyeb / Railway V21
+- MLM parrainage (lien automatique)
 - Dashboard utilisateur
-- Validation des achats (admin)
-- Demande de retrait Mobile Money (user envoie numéro)
-- Commandes admin pour lister / valider / refuser retraits
-- Conçu pour être lancé avec gunicorn bot:app_flask (Web service) ou python bot.py locally
+- Demande de retrait Mobile Money (envoi du numéro)
+- Validation manuelle des achats par l'admin (/addpurchase)
+- Validation/refus des retraits par l'admin
+- Compatible python-telegram-bot==21.4, lancement via gunicorn bot:app_flask
 """
 
 import os
@@ -28,32 +28,33 @@ from telegram.ext import (
     filters,
 )
 
-# ---------------- CONFIG ----------------
-TOKEN = os.getenv("TOKEN")                      # OBLIGATOIRE (Railway env var)
-ADMIN_ID = os.getenv("ADMIN_ID")                # optionnel : ton ID numérique (recommandé)
+# ---------------- CONFIG (via env vars) ----------------
+TOKEN = os.getenv("TOKEN")  # OBLIGATOIRE (mets-le dans Koyeb env)
+ADMIN_ID = os.getenv("ADMIN_ID")  # numérique recommandé
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@RUBENHRM777")
 ACHAT_LINK = os.getenv("ACHAT_LINK", "https://sgzxfbtn.mychariow.shop/prd_8ind83")
 PRODUCT_NAME = os.getenv("PRODUCT_NAME", "Pack Formations Business 2026")
 SEUIL_RECOMPENSE = int(os.getenv("SEUIL_RECOMPENSE", "5"))
+REWARD_PER_REF = float(os.getenv("REWARD_PER_REF", "1000.0"))  # montant par filleul (FCFA)
 DB_FILE = os.getenv("DB_FILE", "referral_bot.db")
-PHONE_REGEX = re.compile(r"^\+?\d{6,15}$")      # accepte +2426..., 06xxxxxx, etc.
-# ----------------------------------------
+PHONE_REGEX = re.compile(r"^\+?\d{6,15}$")
+# -------------------------------------------------------
 
 if not TOKEN:
-    raise RuntimeError("La variable d'environnement TOKEN n'est pas définie. Ajoute-la dans Railway.")
+    raise RuntimeError("La variable d'environnement TOKEN n'est pas définie. Ajoute-la dans Koyeb / Settings.")
 
-# normalize ADMIN_ID
+# normalize ADMIN_ID if present
 if ADMIN_ID:
     try:
         ADMIN_ID = int(ADMIN_ID)
-    except:
+    except Exception:
         ADMIN_ID = None
 
-# Logging
+# logging
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- DATABASE ----------------
+# ---------------- Database helpers ----------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -66,7 +67,6 @@ def init_db():
         purchases INTEGER DEFAULT 0,
         created_at TEXT
     );
-
     CREATE TABLE IF NOT EXISTS referrals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         referrer_code TEXT,
@@ -74,15 +74,13 @@ def init_db():
         referred_username TEXT,
         joined_at TEXT
     );
-
     CREATE TABLE IF NOT EXISTS withdrawals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         telegram_id INTEGER,
         mobile_number TEXT,
-        status TEXT DEFAULT 'pending', -- pending | validated | refused | waiting_number
+        status TEXT DEFAULT 'pending', -- waiting_number, pending, validated, refused
         created_at TEXT
     );
-
     CREATE TABLE IF NOT EXISTS rewards (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         telegram_id INTEGER,
@@ -107,7 +105,7 @@ def db_execute(query: str, params: tuple = (), fetch: bool = False):
     conn.close()
     return None
 
-# ---------------- HELPERS ----------------
+# ---------------- User / referral helpers ----------------
 def get_user_by_telegram(tid: int) -> Optional[tuple]:
     rows = db_execute("SELECT telegram_id, username, ref_code, referrer_code, purchases, created_at FROM users WHERE telegram_id = ?", (tid,), True)
     return rows[0] if rows else None
@@ -165,7 +163,7 @@ def is_admin_user(user) -> bool:
         pass
     return False
 
-# ---------------- TELEGRAM HANDLERS ----------------
+# ---------------- Telegram handlers ----------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
@@ -174,7 +172,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if payload and payload.startswith("ref_"):
         referrer_code = payload.split("ref_", 1)[1]
 
-    # create user if needed
     if not get_user_by_telegram(user.id):
         create_user(user.id, user.username or user.full_name or str(user.id), referrer_code)
         if referrer_code:
@@ -186,9 +183,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
+    welcome = os.getenv("WELCOME_MESSAGE", f"Bienvenue sur {PRODUCT_NAME} 🤑— découvre comment gagner de l'argent en partageant notre ebook !")
     txt = (
         f"👋 Bonjour {user.first_name} !\n\n"
-        f"Bienvenue sur le bot officiel *{PRODUCT_NAME}*.\n\n"
+        f"{welcome}\n\n"
         "Commandes utiles :\n"
         "/achat → Lien d'achat\n"
         "/parrainage → Obtenir ton lien unique\n"
@@ -200,10 +198,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(txt)
 
 async def achat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"🛍️ Lien officiel pour acheter *{PRODUCT_NAME}* :\n{ACHAT_LINK}\n\n"
-        "Après ton achat, envoie la référence avec : /confachat <REFERENCE>"
-    )
+    await update.message.reply_text(f"🛍️ Lien officiel : {ACHAT_LINK}\nAprès ton achat envoie /confachat <REF> pour validation admin.")
 
 async def parrainage_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -225,6 +220,7 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = count_referred(ref_code)
     acheteurs = count_referred_with_purchase(ref_code)
     purchases = u[4]
+    montant_possible = acheteurs * REWARD_PER_REF
     eligible_text = "✅ OUI" if acheteurs >= SEUIL_RECOMPENSE else f"❌ NON (encore {SEUIL_RECOMPENSE - acheteurs})"
     txt = (
         "📊 TON TABLEAU DE BORD\n\n"
@@ -233,6 +229,7 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Filleuls inscrits : {total}\n"
         f"🛒 Filleuls acheteurs : {acheteurs}\n"
         f"🎯 Tes achats personnels : {purchases}\n"
+        f"💰 Montant potentiel (selon filleuls acheteurs) : {montant_possible} FCFA\n"
         f"🏆 Éligible au retrait : {eligible_text}\n\n"
         f"⚠️ Le retrait est disponible UNIQUEMENT après {SEUIL_RECOMPENSE} filleuls acheteurs."
     )
@@ -269,12 +266,8 @@ async def retrait_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # create waiting entry (waiting_number)
     db_execute("INSERT INTO withdrawals (telegram_id, mobile_number, status, created_at) VALUES (?, ?, 'waiting_number', ?)",
                (user.id, '', datetime.utcnow().isoformat()))
-    await update.message.reply_text(
-        "✅ Tu es éligible au retrait.\n"
-        "Envoie maintenant TON NUMÉRO Mobile Money (ex: +2426xxxxxxx ou 06xxxxxx) dans ce chat pour créer ta demande."
-    )
+    await update.message.reply_text("✅ Tu es éligible au retrait. Envoie maintenant TON NUMÉRO Mobile Money (ex: +2426xxxxxxx ou 06xxxxxx).")
 
-# capture text messages for withdrawal numbers
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     user = update.effective_user
@@ -298,7 +291,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
-# ---------------- ADMIN COMMANDS ----------------
+# ---------------- Admin commands ----------------
 async def admin_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_user(update.effective_user):
         await update.message.reply_text("Commande réservée à l'admin.")
@@ -307,9 +300,7 @@ async def admin_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     total_buyers = (db_execute("SELECT COUNT(*) FROM users WHERE purchases>0", (), True) or [[0]])[0][0]
     total_referrals = (db_execute("SELECT COUNT(*) FROM referrals", (), True) or [[0]])[0][0]
     pending_withdrawals = (db_execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'", (), True) or [[0]])[0][0]
-    await update.message.reply_text(
-        f"📈 STATISTIQUES\nMembres: {total_users}\nAcheteurs: {total_buyers}\nReferrals: {total_referrals}\nRetraits en attente: {pending_withdrawals}"
-    )
+    await update.message.reply_text(f"📈 STATS\nMembres: {total_users}\nAcheteurs: {total_buyers}\nReferrals: {total_referrals}\nRetraits en attente: {pending_withdrawals}")
 
 async def addpurchase_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_user(update.effective_user):
@@ -356,7 +347,7 @@ async def valider_retrait_handler(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Commande admin seulement.")
         return
     if not context.args:
-        await update.message.reply_text("Usage: /valider_retrait <withdrawal_id>")
+        await update.message.reply_text("Usage : /valider_retrait <withdrawal_id>")
         return
     try:
         wid = int(context.args[0])
@@ -378,7 +369,7 @@ async def refuser_retrait_handler(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Commande admin seulement.")
         return
     if not context.args:
-        await update.message.reply_text("Usage: /refuser_retrait <withdrawal_id> <raison_opt>")
+        await update.message.reply_text("Usage : /refuser_retrait <withdrawal_id> <raison_opt>")
         return
     try:
         wid = int(context.args[0])
@@ -415,7 +406,7 @@ async def list_eligibles_handler(update: Update, context: ContextTypes.DEFAULT_T
         txt += f"ID:{t[0]} @{t[1]} code:{t[2]} acheteurs:{t[3]}\n"
     await update.message.reply_text(txt)
 
-# ---------------- REGISTER & BACKGROUND BOT ----------------
+# ---------------- Register handlers & run bot ----------------
 def register_handlers(app):
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("achat", achat_handler))
@@ -430,29 +421,28 @@ def register_handlers(app):
     app.add_handler(CommandHandler("valider_retrait", valider_retrait_handler))
     app.add_handler(CommandHandler("refuser_retrait", refuser_retrait_handler))
     app.add_handler(CommandHandler("list_eligibles", list_eligibles_handler))
-    # capture phone numbers / generic text
+    # capture phone numbers
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
 
 def run_telegram_bot():
     app = ApplicationBuilder().token(TOKEN).build()
     register_handlers(app)
     logger.info("Démarrage du bot Telegram (polling) en thread...")
-    print("🤖 Bot Telegram démarré (polling).")
+    print("🤖 Bot démarré (polling).")
     app.run_polling()
 
-# ---------------- FLASK (pour Railway) ----------------
+# Flask app for Koyeb / web healthcheck
 app_flask = Flask(__name__)
 
 @app_flask.route("/")
 def home():
     return "✅ MoneyToFlowsBot en ligne et opérationnel !"
 
-# ---------------- MAIN ----------------
 def main():
     init_db()
     t = threading.Thread(target=run_telegram_bot, daemon=True)
     t.start()
-    # run Flask for the web service (railway / gunicorn will serve app_flask)
+    # run Flask (gunicorn will serve app_flask in production)
     port = int(os.getenv("PORT", "10000"))
     try:
         app_flask.run(host="0.0.0.0", port=port)
